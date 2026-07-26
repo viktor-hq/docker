@@ -9,8 +9,15 @@
 #   - VIKTOR_APP_SECRET : Your Viktor project secret key
 #
 # Minimal required token permissions (set at workflow or job level):
-#   - pull-requests: read   (to read PR metadata and post the result comment)
+#   - pull-requests: write  (to read PR metadata; write is only used by the local fallback that
+#                            posts directly to the PR when the Viktor API itself is unreachable)
 #   - contents: read        (to clone the repository)
+#
+# Optional environment variables:
+#   - VIKTOR_DEEP_MAX_STEPS : Max number of agent tool-call steps before aborting (default: 100).
+#                             The agent only has read-only tools, and each tool call is bounded in
+#                             size (MAX_FILE_SIZE, MAX_SEARCH_RESULTS), so raising this stays
+#                             financially bounded.
 #
 # Usage:
 #   1. Copy this file to .github/workflows/viktor-deep.yml in your repository
@@ -24,7 +31,9 @@ on:
     types: [viktor-deep-analysis]
 
 permissions:
-  pull-requests: read
+  # write: only needed for the local fallback (postFailureComment in entrypoint.js) that posts
+  # directly to the PR when the Viktor API itself is unreachable.
+  pull-requests: write
   contents: read
 
 jobs:
@@ -57,7 +66,10 @@ jobs:
           VCS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Optional: override the default Viktor API URL
           # VIKTOR_API_URL: https://api.viktor.tools
+          # Optional: override the default max agent steps (100)
+          # VIKTOR_DEEP_MAX_STEPS: 100
         run: |
+          docker pull ghcr.io/viktor-tools/docker/deep:latest
           docker run --rm \
             -e VIKTOR_APP_ID \
             -e VIKTOR_APP_SECRET \
