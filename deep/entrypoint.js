@@ -71,6 +71,56 @@ async function apiPost(url, body) {
   return res.json();
 }
 
+async function apiGet(url) {
+  const res = await fetch(url, { headers: authHeaders() });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`HTTP ${res.status} from ${url}: ${text}`);
+  }
+
+  return res.json();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const POLL_INTERVAL_MS = 5000;
+const TURN_TIMEOUT_MS = 10 * 60 * 1000; // stays under the server-side Review TTL (15 min)
+
+// POST mcp/complete/:reviewId enqueues the agent turn and responds immediately (202) instead of
+// blocking on the full LLM turn — see backend issue #429. This polls the companion status
+// endpoint until the turn resolves, so a long-running turn (model retries) never depends on a
+// single HTTP request outliving a proxy timeout.
+async function pollAgentTurn(
+  completeUrl,
+  messages,
+  { pollIntervalMs = POLL_INTERVAL_MS, turnTimeoutMs = TURN_TIMEOUT_MS } = {}
+) {
+  await apiPost(completeUrl, { messages });
+
+  const statusUrl = `${completeUrl}/status`;
+  const deadline = Date.now() + turnTimeoutMs;
+
+  while (Date.now() < deadline) {
+    await sleep(pollIntervalMs);
+
+    let status;
+    try {
+      status = await apiGet(statusUrl);
+    } catch {
+      continue; // transient network failure on the GET: retry at the next tick
+    }
+
+    if (status.status === 'DONE') return status.result;
+    if (status.status === 'ERROR') throw new Error(status.error);
+    // otherwise PENDING: keep polling
+  }
+
+  throw new Error(`Agent turn timed out after ${turnTimeoutMs}ms`);
+}
+
 // The finalize endpoint deliberately responds with HTTP 400 when the analysis completed but
 // scored below the acceptance threshold — that is a valid outcome (to be posted on the PR), not
 // a request/server error. Only treat the response as fatal when it doesn't carry a result.
@@ -427,7 +477,7 @@ async function main() {
 
     let turnResult;
     try {
-      turnResult = await apiPost(completeUrl, { messages });
+      turnResult = await pollAgentTurn(completeUrl, messages);
     } catch (err) {
       await fetch(cancelUrl, { method: 'POST', headers: authHeaders() }).catch(() => {});
       throw new Error(`Agent turn failed: ${err.message}`);
@@ -505,5 +555,7 @@ module.exports = {
   parseAgentResult,
   repoPathAndHost,
   postFailureComment,
+  apiGet,
+  pollAgentTurn,
   TOOLS,
 };
