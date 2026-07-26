@@ -12,9 +12,19 @@
 # Also required: a Pipeline Trigger Token (Settings > CI/CD > Pipeline triggers), configured in
 # the Viktor project settings.
 #
-# The built-in $CI_JOB_TOKEN provides read access to the current repository.
-# For private repositories hosted on a different GitLab instance, use a
-# Project Access Token with read_repository scope stored as GITLAB_TOKEN.
+# The built-in $CI_JOB_TOKEN provides read access to the current repository, but the local
+# fallback that posts directly to the MR (used only when the Viktor API itself is unreachable —
+# see entrypoint.js's postFailureComment) also needs to post/list/delete MR notes, which
+# $CI_JOB_TOKEN cannot do on its own. For private repositories hosted on a different GitLab
+# instance, or to enable that fallback, use a Project Access Token with the `api` scope (or
+# `read_repository` + `write_repository` at minimum, since GitLab has no narrower scope covering
+# MR notes) stored as GITLAB_TOKEN.
+#
+# Optional CI/CD variables:
+#   - VIKTOR_DEEP_MAX_STEPS : Max number of agent tool-call steps before aborting (default: 100).
+#                             The agent only has read-only tools, and each tool call is bounded in
+#                             size (MAX_FILE_SIZE, MAX_SEARCH_RESULTS), so raising this stays
+#                             financially bounded.
 #
 # Usage:
 #   1. Merge or include this file in your .gitlab-ci.yml
@@ -42,6 +52,7 @@ viktor-deep:
   # on "trigger"-sourced pipelines.
   script:
     - |
+      docker pull ghcr.io/viktor-tools/docker/deep:latest
       docker run --rm \
         -e VIKTOR_APP_ID="$VIKTOR_APP_ID" \
         -e VIKTOR_APP_SECRET="$VIKTOR_APP_SECRET" \
@@ -51,4 +62,5 @@ viktor-deep:
         -e MR_IID="$MR_IID" \
         -e VCS_TOKEN="${GITLAB_TOKEN:-$CI_JOB_TOKEN}" \
         -e VIKTOR_API_URL="$VIKTOR_API_URL" \
+        -e VIKTOR_DEEP_MAX_STEPS="$VIKTOR_DEEP_MAX_STEPS" \
         ghcr.io/viktor-tools/docker/deep:latest

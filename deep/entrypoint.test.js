@@ -4,12 +4,20 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execSync } = require('node:child_process');
-const { describe, test, expect, beforeAll, afterAll } = require('bun:test');
+const { describe, test, expect, beforeAll, afterAll, afterEach } = require('bun:test');
 
 // The tools sandbox everything under VIKTOR_REPO_DIR, so tests point it at a throwaway
 // fixture repo instead of the real /repo used in production containers.
 const REPO_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'viktor-entrypoint-test-'));
 process.env.VIKTOR_REPO_DIR = REPO_DIR;
+
+// reportFatalError reads these from module-scope constants computed once at require time, so
+// they must be set before the require() below.
+process.env.PR_NUMBER = '42';
+process.env.REPO_URL = 'https://github.com/owner/repo.git';
+process.env.VCS_TOKEN = 'vcs-secret-token';
+process.env.VIKTOR_APP_ID = 'app-id';
+process.env.VIKTOR_APP_SECRET = 'app-secret';
 
 const {
   safePath,
@@ -24,6 +32,8 @@ const {
   parseAgentResult,
   repoPathAndHost,
   postFailureComment,
+  reportFatalError,
+  SIGNATURE,
   apiGet,
   pollAgentTurn,
 } = require('./entrypoint.js');
@@ -255,12 +265,11 @@ describe('postFailureComment', () => {
     global.fetch = originalFetch;
   });
 
-  test('posts to the GitHub issues comments endpoint for a github.com repo', async () => {
-    let capturedUrl;
-    let capturedOptions;
-    global.fetch = async (url, options) => {
-      capturedUrl = url;
-      capturedOptions = options;
+  test('lists then posts to the GitHub issues comments endpoint for a github.com repo, with a generic message', async () => {
+    const calls = [];
+    global.fetch = async (url, options = {}) => {
+      calls.push({ url, method: options.method || 'GET', options });
+      if (!options.method) return { ok: true, json: async () => [] };
       return { ok: true, json: async () => ({}) };
     };
 
@@ -268,20 +277,52 @@ describe('postFailureComment', () => {
       repoUrl: 'https://github.com/owner/repo.git',
       mergeRequestId: '42',
       vcsToken: 'secret-token',
-      reason: 'Something went wrong.',
     });
 
-    expect(capturedUrl).toBe('https://api.github.com/repos/owner/repo/issues/42/comments');
-    expect(capturedOptions.headers.Authorization).toBe('Bearer secret-token');
-    expect(JSON.parse(capturedOptions.body).body).toContain('Something went wrong.');
+    const listCall = calls.find((c) => c.method === 'GET');
+    const postCall = calls.find((c) => c.method === 'POST');
+    expect(listCall.url).toBe('https://api.github.com/repos/owner/repo/issues/42/comments');
+    expect(postCall.url).toBe('https://api.github.com/repos/owner/repo/issues/42/comments');
+    expect(postCall.options.headers.Authorization).toBe('Bearer secret-token');
+    const body = JSON.parse(postCall.options.body).body;
+    expect(body).toContain('Viktor was unable to process this analysis');
+    expect(body).toContain(SIGNATURE);
+  });
+
+  test('deletes an existing Viktor-signed GitHub comment before posting the fallback message', async () => {
+    const calls = [];
+    global.fetch = async (url, options = {}) => {
+      calls.push({ url, method: options.method || 'GET' });
+      if (!options.method) {
+        return {
+          ok: true,
+          json: async () => [
+            { id: 1, body: `Old report\n\n*${SIGNATURE}*` },
+            { id: 2, body: 'Unrelated comment' },
+          ],
+        };
+      }
+      return { ok: true, json: async () => ({}) };
+    };
+
+    await postFailureComment({
+      repoUrl: 'https://github.com/owner/repo.git',
+      mergeRequestId: '42',
+      vcsToken: 'secret-token',
+    });
+
+    expect(calls).toContainEqual({
+      url: 'https://api.github.com/repos/owner/repo/issues/comments/1',
+      method: 'DELETE',
+    });
+    expect(calls.some((c) => c.url.endsWith('/issues/comments/2'))).toBe(false);
   });
 
   test('posts to the GitLab notes endpoint (URL-encoded project path) for a non-github.com repo', async () => {
-    let capturedUrl;
-    let capturedOptions;
-    global.fetch = async (url, options) => {
-      capturedUrl = url;
-      capturedOptions = options;
+    const calls = [];
+    global.fetch = async (url, options = {}) => {
+      calls.push({ url, method: options.method || 'GET', options });
+      if (!options.method) return { ok: true, json: async () => [] };
       return { ok: true, json: async () => ({}) };
     };
 
@@ -289,11 +330,33 @@ describe('postFailureComment', () => {
       repoUrl: 'https://gitlab.com/group/subgroup/repo.git',
       mergeRequestId: '7',
       vcsToken: 'secret-token',
-      reason: 'Boom.',
     });
 
-    expect(capturedUrl).toBe('https://gitlab.com/api/v4/projects/group%2Fsubgroup%2Frepo/merge_requests/7/notes');
-    expect(capturedOptions.headers['PRIVATE-TOKEN']).toBe('secret-token');
+    const postCall = calls.find((c) => c.method === 'POST');
+    expect(postCall.url).toBe('https://gitlab.com/api/v4/projects/group%2Fsubgroup%2Frepo/merge_requests/7/notes');
+    expect(postCall.options.headers['PRIVATE-TOKEN']).toBe('secret-token');
+  });
+
+  test('deletes an existing Viktor-signed GitLab note before posting the fallback message', async () => {
+    const calls = [];
+    global.fetch = async (url, options = {}) => {
+      calls.push({ url, method: options.method || 'GET' });
+      if (!options.method) {
+        return { ok: true, json: async () => [{ id: 9, body: `Old report\n\n*${SIGNATURE}*` }] };
+      }
+      return { ok: true, json: async () => ({}) };
+    };
+
+    await postFailureComment({
+      repoUrl: 'https://gitlab.com/group/repo.git',
+      mergeRequestId: '7',
+      vcsToken: 'secret-token',
+    });
+
+    expect(calls).toContainEqual({
+      url: 'https://gitlab.com/api/v4/projects/group%2Frepo/merge_requests/7/notes/9',
+      method: 'DELETE',
+    });
   });
 
   test('does nothing when the repo URL, merge request ID, or token is missing', async () => {
@@ -303,9 +366,9 @@ describe('postFailureComment', () => {
       return { ok: true, json: async () => ({}) };
     };
 
-    await postFailureComment({ repoUrl: '', mergeRequestId: '42', vcsToken: 'x', reason: 'x' });
-    await postFailureComment({ repoUrl: 'https://github.com/owner/repo.git', mergeRequestId: '', vcsToken: 'x', reason: 'x' });
-    await postFailureComment({ repoUrl: 'https://github.com/owner/repo.git', mergeRequestId: '42', vcsToken: '', reason: 'x' });
+    await postFailureComment({ repoUrl: '', mergeRequestId: '42', vcsToken: 'x' });
+    await postFailureComment({ repoUrl: 'https://github.com/owner/repo.git', mergeRequestId: '', vcsToken: 'x' });
+    await postFailureComment({ repoUrl: 'https://github.com/owner/repo.git', mergeRequestId: '42', vcsToken: '' });
 
     expect(called).toBe(false);
   });
@@ -320,9 +383,51 @@ describe('postFailureComment', () => {
         repoUrl: 'https://github.com/owner/repo.git',
         mergeRequestId: '42',
         vcsToken: 'secret-token',
-        reason: 'x',
       })
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('reportFatalError', () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  test('reports to the Viktor API mcp/error endpoint on the primary path', async () => {
+    let capturedUrl;
+    let capturedOptions;
+    global.fetch = async (url, options) => {
+      capturedUrl = url;
+      capturedOptions = options;
+      return { ok: true, json: async () => ({ success: true }) };
+    };
+
+    await reportFatalError('Agent exceeded maximum steps (100).');
+
+    expect(capturedUrl).toBe('https://api.viktor.tools/semantic-analyze/mcp/error');
+    expect(capturedOptions.headers['X-APP-ID']).toBe('app-id');
+    expect(JSON.parse(capturedOptions.body)).toEqual({
+      mergeRequestId: '42',
+      reason: 'Agent exceeded maximum steps (100).',
+    });
+  });
+
+  test('falls back to a direct VCS comment when the Viktor API call fails', async () => {
+    const calls = [];
+    global.fetch = async (url, options = {}) => {
+      calls.push({ url, method: options.method || 'GET' });
+      if (url === 'https://api.viktor.tools/semantic-analyze/mcp/error') {
+        return { ok: false, status: 502, text: async () => 'Bad Gateway' };
+      }
+      if (!options.method) return { ok: true, json: async () => [] };
+      return { ok: true, json: async () => ({}) };
+    };
+
+    await reportFatalError('Agent exceeded maximum steps (100).');
+
+    expect(calls.some((c) => c.method === 'POST' && c.url.includes('/issues/42/comments'))).toBe(true);
   });
 });
 
