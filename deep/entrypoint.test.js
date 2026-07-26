@@ -24,6 +24,8 @@ const {
   parseAgentResult,
   repoPathAndHost,
   postFailureComment,
+  apiGet,
+  pollAgentTurn,
 } = require('./entrypoint.js');
 
 function write(relPath, content) {
@@ -321,6 +323,107 @@ describe('postFailureComment', () => {
         reason: 'x',
       })
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('pollAgentTurn', () => {
+  const originalFetch = global.fetch;
+
+  afterAll(() => {
+    global.fetch = originalFetch;
+  });
+
+  test('posts the messages then polls status until DONE, returning the result', async () => {
+    const calls = [];
+    let statusCallCount = 0;
+    global.fetch = async (url, options) => {
+      calls.push({ url, options });
+      if (options?.method === 'POST') {
+        return { ok: true, json: async () => ({ reviewId: 'r1', status: 'PENDING' }) };
+      }
+      statusCallCount++;
+      if (statusCallCount < 2) {
+        return { ok: true, json: async () => ({ status: 'PENDING' }) };
+      }
+      return { ok: true, json: async () => ({ status: 'DONE', result: { text: 'done', toolCalls: [], finishReason: 'stop' } }) };
+    };
+
+    const result = await pollAgentTurn('https://api.example.com/complete/r1', [{ role: 'user', content: 'hi' }], {
+      pollIntervalMs: 1,
+      turnTimeoutMs: 1000,
+    });
+
+    expect(result).toEqual({ text: 'done', toolCalls: [], finishReason: 'stop' });
+    expect(calls[0].options.method).toBe('POST');
+    expect(calls.filter((c) => c.url === 'https://api.example.com/complete/r1/status').length).toBe(2);
+  });
+
+  test('throws when the turn status resolves to ERROR', async () => {
+    global.fetch = async (url, options) => {
+      if (options?.method === 'POST') {
+        return { ok: true, json: async () => ({ reviewId: 'r1', status: 'PENDING' }) };
+      }
+      return { ok: true, json: async () => ({ status: 'ERROR', error: 'Model call failed' }) };
+    };
+
+    await expect(
+      pollAgentTurn('https://api.example.com/complete/r1', [], { pollIntervalMs: 1, turnTimeoutMs: 1000 })
+    ).rejects.toThrow('Model call failed');
+  });
+
+  test('throws a timeout error when the turn stays PENDING past the budget', async () => {
+    global.fetch = async (url, options) => {
+      if (options?.method === 'POST') {
+        return { ok: true, json: async () => ({ reviewId: 'r1', status: 'PENDING' }) };
+      }
+      return { ok: true, json: async () => ({ status: 'PENDING' }) };
+    };
+
+    await expect(
+      pollAgentTurn('https://api.example.com/complete/r1', [], { pollIntervalMs: 5, turnTimeoutMs: 20 })
+    ).rejects.toThrow(/timed out/);
+  });
+
+  test('does not interrupt polling on a transient network failure of the status GET', async () => {
+    let statusCallCount = 0;
+    global.fetch = async (url, options) => {
+      if (options?.method === 'POST') {
+        return { ok: true, json: async () => ({ reviewId: 'r1', status: 'PENDING' }) };
+      }
+      statusCallCount++;
+      if (statusCallCount === 1) {
+        throw new Error('network down');
+      }
+      return { ok: true, json: async () => ({ status: 'DONE', result: { text: 'ok', toolCalls: [], finishReason: 'stop' } }) };
+    };
+
+    const result = await pollAgentTurn('https://api.example.com/complete/r1', [], {
+      pollIntervalMs: 1,
+      turnTimeoutMs: 1000,
+    });
+
+    expect(result).toEqual({ text: 'ok', toolCalls: [], finishReason: 'stop' });
+    expect(statusCallCount).toBe(2);
+  });
+});
+
+describe('apiGet', () => {
+  const originalFetch = global.fetch;
+
+  afterAll(() => {
+    global.fetch = originalFetch;
+  });
+
+  test('returns the parsed JSON body on success', async () => {
+    global.fetch = async () => ({ ok: true, json: async () => ({ hello: 'world' }) });
+
+    await expect(apiGet('https://api.example.com/status')).resolves.toEqual({ hello: 'world' });
+  });
+
+  test('throws with the status and body text on failure', async () => {
+    global.fetch = async () => ({ ok: false, status: 500, text: async () => 'boom' });
+
+    await expect(apiGet('https://api.example.com/status')).rejects.toThrow(/HTTP 500/);
   });
 });
 
