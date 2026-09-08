@@ -138,13 +138,16 @@ function printTimingSummary(stats, totalMs) {
   console.log('====================================\n');
 }
 
-const POLL_INTERVAL_MS = 5000;
+// The status endpoint long-polls: it holds the request open (~25s server-side) until the turn
+// resolves, then responds. So while a turn is running each GET already blocks for up to ~25s and
+// this delay is just a small backoff between two long-poll requests (and after transient errors).
+const POLL_INTERVAL_MS = 500;
 const TURN_TIMEOUT_MS = 10 * 60 * 1000; // stays under the server-side Review TTL (15 min)
 
 // POST mcp/complete/:reviewId enqueues the agent turn and responds immediately (202) instead of
-// blocking on the full LLM turn — see backend issue #429. This polls the companion status
+// blocking on the full LLM turn — see backend issue #429. This long-polls the companion status
 // endpoint until the turn resolves, so a long-running turn (model retries) never depends on a
-// single HTTP request outliving a proxy timeout.
+// single HTTP request outliving a proxy timeout, while still learning the result promptly.
 async function pollAgentTurn(
   completeUrl,
   messages,
@@ -160,13 +163,13 @@ async function pollAgentTurn(
   let polls = 0;
 
   while (Date.now() < deadline) {
-    await sleep(pollIntervalMs);
     polls++;
 
     let status;
     try {
       status = await apiGet(statusUrl);
     } catch {
+      await sleep(pollIntervalMs);
       continue; // transient network failure on the GET: retry at the next tick
     }
 
@@ -190,7 +193,8 @@ async function pollAgentTurn(
       return status.result;
     }
     if (status.status === 'ERROR') throw new Error(status.error);
-    // otherwise PENDING: keep polling
+    // otherwise PENDING (the long-poll hit its hold window): small backoff, then re-request
+    await sleep(pollIntervalMs);
   }
 
   throw new Error(`Agent turn timed out after ${turnTimeoutMs}ms`);
