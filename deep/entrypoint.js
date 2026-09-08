@@ -87,6 +87,57 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// --- Timing helpers ---
+
+function fmtDuration(ms) {
+  if (ms < 1000) {
+    return `${ms}ms`;
+  }
+
+  const s = ms / 1000;
+  if (s < 60) {
+    return `${s.toFixed(1)}s`;
+  }
+
+  const m = Math.floor(s / 60);
+
+  return `${m}m${Math.round(s - m * 60)}s`;
+}
+
+function printTimingSummary(stats, totalMs) {
+  const line = (k, v) => console.log(`  ${k.padEnd(28)} ${v}`);
+  console.log('\n========== TIMING SUMMARY ==========');
+  line('Total run', fmtDuration(totalMs));
+  line('git clone', fmtDuration(stats.cloneMs));
+  line('git diff', fmtDuration(stats.diffMs));
+  line('init request', fmtDuration(stats.initMs));
+  line('agent loop steps', String(stats.steps));
+  line('agent turn wait (wall)', fmtDuration(stats.agentWaitMs));
+  line('  server LLM wait', fmtDuration(stats.serverLlmMs));
+  line('  server model selection', fmtDuration(stats.serverModelSelectionMs));
+  line('  server bookkeeping', fmtDuration(stats.serverBookkeepingMs));
+  line('tool execution (local)', `${fmtDuration(stats.toolExecMs)} over ${stats.toolCallCount} call(s)`);
+  line('finalize request', fmtDuration(stats.finalizeMs));
+
+  const modelTurns = Object.entries(stats.modelTurns);
+  if (modelTurns.length) {
+    console.log('  turns per model:');
+    for (const [name, n] of modelTurns.sort((a, b) => b[1] - a[1])) {
+      console.log(`    ${name}: ${n}`);
+    }
+  }
+
+  const toolTime = Object.entries(stats.toolTime);
+  if (toolTime.length) {
+    console.log('  time per tool:');
+    for (const [name, ms] of toolTime.sort((a, b) => b[1] - a[1])) {
+      console.log(`    ${name}: ${fmtDuration(ms)}`);
+    }
+  }
+
+  console.log('====================================\n');
+}
+
 const POLL_INTERVAL_MS = 5000;
 const TURN_TIMEOUT_MS = 10 * 60 * 1000; // stays under the server-side Review TTL (15 min)
 
@@ -99,13 +150,18 @@ async function pollAgentTurn(
   messages,
   { pollIntervalMs = POLL_INTERVAL_MS, turnTimeoutMs = TURN_TIMEOUT_MS } = {}
 ) {
+  const start = Date.now();
+  const enqueueStart = Date.now();
   await apiPost(completeUrl, { messages });
+  const enqueueMs = Date.now() - enqueueStart;
 
   const statusUrl = `${completeUrl}/status`;
   const deadline = Date.now() + turnTimeoutMs;
+  let polls = 0;
 
   while (Date.now() < deadline) {
     await sleep(pollIntervalMs);
+    polls++;
 
     let status;
     try {
@@ -114,7 +170,25 @@ async function pollAgentTurn(
       continue; // transient network failure on the GET: retry at the next tick
     }
 
-    if (status.status === 'DONE') return status.result;
+    if (status.status === 'DONE') {
+      const waitedMs = Date.now() - start;
+      // waitedMs includes our poll-interval sleeps; server-side timings (below) are the real cost.
+      const t = status.result?.timings;
+      console.log(
+        `[timing]   waited ${fmtDuration(waitedMs)} for agent turn ` +
+          `(enqueue ${enqueueMs}ms, ${polls} status polls @ ${pollIntervalMs}ms)`
+      );
+
+      if (t) {
+        console.log(
+          `[timing]   server turn ${fmtDuration(t.totalMs)}: llm ${fmtDuration(t.llmMs)}, ` +
+            `model selection ${fmtDuration(t.modelSelectionMs)}, bookkeeping ${fmtDuration(t.bookkeepingMs)}, ` +
+            `${t.attempts} attempt(s)`
+        );
+      }
+
+      return status.result;
+    }
     if (status.status === 'ERROR') throw new Error(status.error);
     // otherwise PENDING: keep polling
   }
@@ -481,33 +555,59 @@ function parseAgentResult(text) {
 // --- Main ---
 
 async function main() {
+  const runStart = Date.now();
+
+  // Per-run timing accumulators, summarized at the end and on step-limit abort.
+  const stats = {
+    cloneMs: 0,
+    diffMs: 0,
+    initMs: 0,
+    finalizeMs: 0,
+    agentWaitMs: 0, // wall time spent waiting on pollAgentTurn (includes poll sleeps)
+    serverLlmMs: 0, // server-reported time awaiting the LLM
+    serverModelSelectionMs: 0,
+    serverBookkeepingMs: 0,
+    toolExecMs: 0,
+    toolCallCount: 0,
+    steps: 0,
+    modelTurns: {}, // model name -> number of turns
+    toolTime: {}, // tool name -> cumulated ms
+  };
+
   // 1. Clone the repository
   console.log(`Cloning repository on branch "${BRANCH}"...`);
   const gitUsername = REPO_URL.includes('github.com') ? 'x-access-token' : 'gitlab-ci-token';
   const repoWithToken = REPO_URL.replace('://', `://${gitUsername}:${VCS_TOKEN}@`);
+  const cloneStart = Date.now();
   try {
     exec(`git clone --depth=50 --branch ${BRANCH} ${repoWithToken} ${REPO_DIR}`);
   } catch (err) {
     throw new Error(`Failed to clone repository: ${err.message}`);
   }
-  console.log('Clone successful.');
+  stats.cloneMs = Date.now() - cloneStart;
+  console.log(`Clone successful. [timing] clone: ${fmtDuration(stats.cloneMs)}`);
 
   // 2. Generate diff
+  const diffStart = Date.now();
   exec(`git -C ${REPO_DIR} fetch origin ${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}`);
   const codeDiff = exec(`git -C ${REPO_DIR} diff origin/${BASE_BRANCH}...HEAD`);
+  stats.diffMs = Date.now() - diffStart;
 
   if (!codeDiff) {
     throw new Error(`No diff found between "${BASE_BRANCH}" and "${BRANCH}".`);
   }
-  console.log(`Diff size: ${codeDiff.length} characters`);
+  console.log(`Diff size: ${codeDiff.length} characters [timing] diff: ${fmtDuration(stats.diffMs)}`);
 
   // 3. Init review session
   console.log(`Initiating Deep analysis for branch "${BRANCH}"...`);
+  const initStart = Date.now();
   const initData = await apiPost(`${API_URL}/semantic-analyze/mcp/init`, {
     branch: BRANCH,
     mode: DEFAULT_MODE,
     mergeRequestId: MERGE_REQUEST_ID,
   });
+  stats.initMs = Date.now() - initStart;
+  console.log(`[timing] init: ${fmtDuration(stats.initMs)}`);
 
   const { reviewId, issueData, completeUrl, cancelUrl, finalizeUrl } = initData;
 
@@ -531,6 +631,7 @@ async function main() {
 
   while (stepCount < MAX_STEPS) {
     stepCount++;
+    stats.steps = stepCount;
     console.log(`Agent step ${stepCount}...`);
 
     if (stepCount === MAX_STEPS - 3) {
@@ -544,14 +645,24 @@ async function main() {
     }
 
     let turnResult;
+    const waitStart = Date.now();
     try {
       turnResult = await pollAgentTurn(completeUrl, messages);
     } catch (err) {
       await fetch(cancelUrl, { method: 'POST', headers: authHeaders() }).catch(() => {});
       throw new Error(`Agent turn failed: ${err.message}`);
     }
+    stats.agentWaitMs += Date.now() - waitStart;
 
-    const { text, toolCalls, finishReason } = turnResult;
+    const { text, toolCalls, finishReason, model, timings } = turnResult;
+
+    console.log(`  Model used this turn: ${model ?? 'unknown'} (finishReason=${finishReason})`);
+    stats.modelTurns[model ?? 'unknown'] = (stats.modelTurns[model ?? 'unknown'] ?? 0) + 1;
+    if (timings) {
+      stats.serverLlmMs += timings.llmMs ?? 0;
+      stats.serverModelSelectionMs += timings.modelSelectionMs ?? 0;
+      stats.serverBookkeepingMs += timings.bookkeepingMs ?? 0;
+    }
 
     // Add assistant message to history
     const assistantMsg = { role: 'assistant', text: text || '' };
@@ -574,27 +685,41 @@ async function main() {
       // 6. Finalize
       console.log('Finalizing analysis...');
       let finalizeResult;
+      const finalizeStart = Date.now();
       try {
         finalizeResult = await apiPostFinalize(finalizeUrl, { result });
       } catch (err) {
         throw new Error(`Finalize failed: ${err.message}`);
       }
+      stats.finalizeMs = Date.now() - finalizeStart;
 
       const score = finalizeResult?.result?.completionScore ?? 'N/A';
       console.log(`Analysis complete. Completion score: ${score}`);
+      printTimingSummary(stats, Date.now() - runStart);
       return;
     }
 
     // Execute tool calls and add results
     const toolResultContents = [];
+    const stepToolStart = Date.now();
     for (const tc of toolCalls) {
-      console.log(`  Tool call: ${tc.name}(${JSON.stringify(tc.input)})`);
+      const tcStart = Date.now();
       const result = executeTool(tc.name, tc.input);
+      const tcMs = Date.now() - tcStart;
+      stats.toolExecMs += tcMs;
+      stats.toolCallCount++;
+      stats.toolTime[tc.name] = (stats.toolTime[tc.name] ?? 0) + tcMs;
+      console.log(`  Tool call: ${tc.name}(${JSON.stringify(tc.input)}) -> ${fmtDuration(tcMs)}`);
       toolResultContents.push({ toolCallId: tc.id, toolName: tc.name, result });
     }
+
+    console.log(
+      `  Step ${stepCount}: ${toolCalls.length} tool call(s) executed in ${fmtDuration(Date.now() - stepToolStart)}`
+    );
     messages.push({ role: 'tool', results: toolResultContents });
   }
 
+  printTimingSummary(stats, Date.now() - runStart);
   await fetch(cancelUrl, { method: 'POST', headers: authHeaders() }).catch(() => {});
   throw new Error(`Agent exceeded maximum steps (${MAX_STEPS}).`);
 }
