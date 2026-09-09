@@ -463,6 +463,34 @@ describe('pollAgentTurn', () => {
     expect(calls.filter((c) => c.url === 'https://api.example.com/complete/r1/status').length).toBe(2);
   });
 
+  test('describes status requests as long-polls and the interval as backoff', async () => {
+    const logs = [];
+    const originalConsoleLog = console.log;
+    global.fetch = async (url, options) => {
+      if (options?.method === 'POST') {
+        return { ok: true, json: async () => ({ reviewId: 'r1', status: 'PENDING' }) };
+      }
+      return {
+        ok: true,
+        json: async () => ({ status: 'DONE', result: { text: 'done', toolCalls: [], finishReason: 'stop' } }),
+      };
+    };
+    console.log = (...args) => logs.push(args.join(' '));
+
+    try {
+      await pollAgentTurn('https://api.example.com/complete/r1', [], {
+        pollIntervalMs: 500,
+        turnTimeoutMs: 1000,
+      });
+    } finally {
+      console.log = originalConsoleLog;
+    }
+
+    const timingLog = logs.find((line) => line.includes('waited'));
+    expect(timingLog).toContain('1 status long-poll (max 25.0s each), 500ms backoff between polls');
+    expect(timingLog).not.toContain('polls @ 500ms');
+  });
+
   test('throws when the turn status resolves to ERROR', async () => {
     global.fetch = async (url, options) => {
       if (options?.method === 'POST') {

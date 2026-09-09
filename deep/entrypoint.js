@@ -142,6 +142,7 @@ function printTimingSummary(stats, totalMs) {
 // resolves, then responds. So while a turn is running each GET already blocks for up to ~25s and
 // this delay is just a small backoff between two long-poll requests (and after transient errors).
 const POLL_INTERVAL_MS = 500;
+const STATUS_LONG_POLL_MAX_MS = 25_000;
 const TURN_TIMEOUT_MS = 10 * 60 * 1000; // stays under the server-side Review TTL (15 min)
 
 // POST mcp/complete/:reviewId enqueues the agent turn and responds immediately (202) instead of
@@ -179,7 +180,8 @@ async function pollAgentTurn(
       const t = status.result?.timings;
       console.log(
         `[timing]   waited ${fmtDuration(waitedMs)} for agent turn ` +
-          `(enqueue ${enqueueMs}ms, ${polls} status polls @ ${pollIntervalMs}ms)`
+          `(enqueue ${enqueueMs}ms, ${polls} status long-poll${polls === 1 ? '' : 's'} ` +
+          `(max ${fmtDuration(STATUS_LONG_POLL_MAX_MS)} each), ${pollIntervalMs}ms backoff between polls)`
       );
 
       if (t) {
